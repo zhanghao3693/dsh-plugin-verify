@@ -21,6 +21,9 @@ jobs:
         with:
           node-version: "22.19"
 
+      - name: Enable pnpm
+        run: corepack enable
+
       - name: Run verification
         env:
           DPH_API_URL: https://dpharness.com
