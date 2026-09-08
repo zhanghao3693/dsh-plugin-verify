@@ -21,8 +21,9 @@ jobs:
         with:
           node-version: "22.19"
 
-      - name: Enable pnpm
-        run: corepack enable
+      - name: Install pnpm
+        run: npm i -g pnpm
+
 
       - name: Run verification
         env:
