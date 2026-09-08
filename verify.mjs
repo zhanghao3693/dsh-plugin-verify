@@ -69,17 +69,29 @@ async function main() {
   console.log("  dsh CLI 就绪");
 
   console.log("▶ 取待验证插件列表");
+  if (!TOKEN) {
+    console.error("❌ DPH_API_TOKEN 未配置——回传与取列表都无法鉴权，请检查仓库 Secret");
+    process.exit(1);
+  }
   let list = [];
   try {
-    const res = await fetch(`${API}/api/verify/queue?limit=${LIMIT}`);
-    const j = await res.json();
-    list = j.items || [];
+    const res = await fetch(`${API}/api/verify/queue?limit=${LIMIT}`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    const body = await res.text();
+    console.log(`  HTTP ${res.status} | 响应前 200 字符: ${body.slice(0, 200)}`);
+    if (!res.ok) {
+      console.error(`❌ queue 请求失败 HTTP ${res.status}——401/403 = token 不一致，检查 Secret DPH_API_TOKEN 与站点 env VERIFY_TOKEN`);
+      process.exit(1);
+    }
+    list = JSON.parse(body).items || [];
   } catch (e) {
-    console.error("取列表失败：", String(e).slice(0, 200));
+    console.error("❌ 取列表异常：", String(e).slice(0, 300));
+    process.exit(1);
   }
   if (!list.length) {
-    console.log("列表为空，退出");
-    return;
+    console.error("❌ 列表为空（站点返回 0 个插件）——异常情况，报错退出");
+    process.exit(1);
   }
   console.log(`  本轮验证 ${list.length} 个插件`);
 
@@ -115,7 +127,8 @@ async function main() {
       });
       console.log("  回传状态：", res.status, (await res.text()).slice(0, 120));
     } catch (e) {
-      console.error("  回传失败：", String(e).slice(0, 200));
+      console.error("  ❌ 回传失败：", String(e).slice(0, 300));
+      process.exitCode = 1;
     }
   } else {
     console.log("（未配置 DPH_API_TOKEN，跳过回传）");
