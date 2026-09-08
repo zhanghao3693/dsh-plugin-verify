@@ -95,16 +95,28 @@ async function main() {
   }
   console.log(`  本轮验证 ${list.length} 个插件`);
 
+  // dsh 的 plugin 子命令运行在 profile 上下文（内部是 pnpm 转发器），
+  // 缺 --profile 必报 "required option '--profile <name>'"（2026-09-08 第一轮 100/100 失败的根因）。
+  // profile 首次使用自动初始化，无需预创建。
+  console.log("▶ 初始化 verify profile");
+  await run("dsh", ["plugin", "--profile", "verify", "list"], { env });
+
   const results = [];
   for (const fullName of list) {
-    const r = await run("dsh", ["plugin", "add", fullName], { env });
+    const r = await run("dsh", ["plugin", "--profile", "verify", "add", fullName], { env });
     const started = Date.now();
     let item;
     if (r.code === 0) {
       item = { fullName, status: "pass", reason: null, detail: null, durationMs: Date.now() - started };
     } else {
       const c = classifyError(r.stderr, r.stdout);
-      item = { fullName, status: "fail", reason: c.reason, detail: c.detail, durationMs: Date.now() - started };
+      let detail = c.detail;
+      if (c.reason === "unknown" && results.filter((x) => x.reason === "unknown").length === 0) {
+        // 第一个 unknown 附带 dsh plugin --help，帮助定位命令格式
+        const help = await run("dsh", ["plugin", "--profile", "verify", "--help"], { env });
+        detail = (c.detail + " || HELP: " + (help.stdout || help.stderr).slice(0, 400)).slice(0, 500);
+      }
+      item = { fullName, status: "fail", reason: c.reason, detail, durationMs: Date.now() - started };
     }
     console.log(`  ${item.status === "pass" ? "🟢" : "🔴"} ${fullName} ${item.reason ? "(" + item.reason + ")" : ""}`);
     results.push(item);
