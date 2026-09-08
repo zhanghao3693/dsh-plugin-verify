@@ -1,0 +1,37 @@
+name: dsh plugin verify
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "本轮验证插件数"
+        required: false
+        default: "100"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19"
+
+      - name: Run verification
+        env:
+          DPH_API_URL: https://dpharness.com
+          DPH_API_TOKEN: ${{ secrets.DPH_API_TOKEN }}
+          VERIFY_LIMIT: ${{ github.event.inputs.limit || '100' }}
+        run: node verify.mjs
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-results
+          path: verify-results.json
+          retention-days: 30
