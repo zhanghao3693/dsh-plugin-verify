@@ -2,17 +2,8 @@ name: dsh plugin verify
 
 on:
   schedule:
-    # 每 2 小时一轮 —— 这是「不引入 PAT 前提下」唯一能提高日吞吐的手段。
-    #
-    # 为什么不搞「跑完自链」：GitHub 禁止 workflow 监听自身
-    #   (`workflow 'dsh plugin verify' cannot listen to itself`)，文件会直接失效；
-    # 而拆成两个 workflow 互推也不行 —— 用 GITHUB_TOKEN 触发 dispatches
-    # 不会连锁触发新 workflow，必须用 PAT。
-    #
-    # 为什么不加大单轮 limit：100 个约 75 分钟，加到 200 → 150 分钟，
-    # 越长越容易被 GitHub 回收 runner（曾见 exit code 143）。加频率、不加单轮长度。
-    #
-    # 12 轮/天 × 100 = 约 1200 个/天（原 2 轮/天只有 200）。
+    # 每 2 小时一轮 —— 这是不引入 PAT 前提下唯一能提高日吞吐的手段。
+    # （GitHub 禁止 workflow 监听自身，自链方案已证伪，见文件末注释。）
     - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
