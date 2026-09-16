@@ -1,0 +1,43 @@
+name: Arena leaderboard sync
+
+# 抓 LMArena（Arena）官方文本榜并回写 dpharness.com 首页的「大模型排行榜 · 国外榜」。
+#
+# 为什么必须放在 Actions：lmarena.ai 与 huggingface.co 在中国大陆不可达，
+# 而站点服务器在腾讯云境内（2026-09-16 实测 code=000）。
+# 国内榜走站点自己的定时任务（SuperCLUE 的 xlsx 境内可直连），两边互不重叠。
+
+on:
+  schedule:
+    # 北京时间 06:00（UTC 22:00）—— 早于站点 07:00 的国内榜同步，便于运维一次性查看
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只抓取不推送（排查用）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch and push leaderboard
+        env:
+          DPH_API_URL: https://dpharness.com
+          DPH_API_TOKEN: ${{ secrets.DPH_API_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python scripts/fetch_arena_leaderboard.py --dry-run
+          else
+            python scripts/fetch_arena_leaderboard.py
+          fi

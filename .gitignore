@@ -1,0 +1,8 @@
+# Python 运行时产物（scripts/ 下有 .py，本地跑一次就会生成）
+__pycache__/
+*.py[cod]
+
+# 依赖与日志
+node_modules/
+*.log
+.DS_Store
