@@ -2,9 +2,23 @@ name: dsh plugin verify
 
 on:
   schedule:
-    # 每 2 小时一轮 —— 这是不引入 PAT 前提下唯一能提高日吞吐的手段。
-    # （GitHub 禁止 workflow 监听自身，自链方案已证伪，见文件末注释。）
-    - cron: "0 */2 * * *"
+    # ⚠️ 保持低频（2026-09-17 诊断后回退）。
+    #
+    # 历史：09-15 之前是 "0 3 * * *"（1 次/天），当时每轮能跑满 10~12 分钟且成功；
+    # 09-16 12:11 改成 "0 */2 * * *"（12 次/天）后，CI 立刻持续失败 ——
+    # 运行约 85 秒即收到 SIGTERM（exit 143 / "runner has received a shutdown signal"）。
+    #
+    # 决定性证据（耗时分布，成功比失败长得多）：
+    #   成功 739s / 697s / 662s  ← 远长于失败的那些
+    #   失败  85s /  85s /  81s / 96s / 77s
+    # 实验：limit=1 → 39s 成功；limit=10 → 85s 失败；limit=100 → 85s 失败。
+    # ⇒ 不是「任务时长门槛」（否则不会成功跑过 739s），
+    #   而是高频 schedule 触发了 GitHub 的限流/降级，
+    #   被降级后 runner 只被允许执行约 39 秒，短任务侥幸完成、长任务被杀。
+    #
+    # 若日后要提速：应改用「跑完自链」而非加密 cron
+    #（GitHub 禁止 workflow 监听自身，需用带 workflow scope 的凭据调 dispatches）。
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       limit:
