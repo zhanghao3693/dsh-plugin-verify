@@ -2,16 +2,59 @@ name: dsh plugin verify
 
 on:
   schedule:
-        - cron: "0 3,15 * * *"
+    # 保底定时点：自链在「上一轮真实失败」时会断掉（例如 runner 被回收），
+    # 所以这两个点必须留着兜底，不要因为有了自链就删掉。
+    - cron: "0 3,15 * * *"
   workflow_dispatch:
     inputs:
       limit:
         description: "本轮验证插件数"
         required: false
         default: "100"
+  # 自链：本 workflow 完成后再次触发自己，消除轮间空闲。
+  # 原为每天 2 个定时点 × 每轮 100 ⇒ 日吞吐仅 200；
+  # 而验证本身约 75 分钟/100 个，速率上限约 1900/天。
+  workflow_run:
+    workflows: ["dsh plugin verify"]
+    types: [completed]
 
 jobs:
+  # 自链的终止判断：每轮开始前先探一次队列
+  check:
+    runs-on: ubuntu-latest
+    # 只在前一轮「成功」时才续跑。注意这不是可选的 ——
+    # 它和下面「队列空就 exit 1」配合，才构成自链的终止条件（详见 verify job 的注释）。
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    outputs:
+      has_more: ${{ steps.probe.outputs.has_more }}
+      limit: ${{ steps.probe.outputs.limit }}
+    steps:
+      - id: probe
+        env:
+          DPH_API_URL: https://dpharness.com
+          DPH_API_TOKEN: ${{ secrets.DPH_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          LIMIT="${{ github.event.inputs.limit || '100' }}"
+          RESP=$(curl -fsS -H "Authorization: Bearer $DPH_API_TOKEN" \
+            "$DPH_API_URL/api/verify/queue?limit=1")
+          REMAINING=$(printf '%s' "$RESP" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{process.stdout.write(String(JSON.parse(s).remaining ?? 0))}catch(e){process.stdout.write('0')}})")
+          echo "队列剩余：$REMAINING"
+          echo "limit=$LIMIT" >> "$GITHUB_OUTPUT"
+          if [ "$REMAINING" -le 0 ]; then
+            # ── 自链的终止点 ──
+            # 队列跑空时，本刻意「失败」结束。
+            # workflow_run 只在上一轮 conclusion == 'success' 才续跑，
+            # 所以「故意失败」正好等于「不再触发下一轮」。
+            # 若这里 exit 0，空轮会被判为 success 并继续触发 → 无限循环、白烧额度。
+            echo "::notice::队列已空，自链在此终止（本轮以失败结束是预期行为）"
+            exit 1
+          fi
+          echo "has_more=true" >> "$GITHUB_OUTPUT"
+
   verify:
+    needs: check
+    if: needs.check.outputs.has_more == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -24,12 +67,11 @@ jobs:
       - name: Install pnpm
         run: npm i -g pnpm
 
-
       - name: Run verification
         env:
           DPH_API_URL: https://dpharness.com
           DPH_API_TOKEN: ${{ secrets.DPH_API_TOKEN }}
-          VERIFY_LIMIT: ${{ github.event.inputs.limit || '100' }}
+          VERIFY_LIMIT: ${{ needs.check.outputs.limit }}
         run: node verify.mjs
 
       - name: Upload results
