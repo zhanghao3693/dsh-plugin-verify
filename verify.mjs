@@ -34,7 +34,7 @@
  *   DPH_API_URL   站点地址，默认 https://dpharness.com
  *   DPH_API_TOKEN 回传鉴权（与站点 env 的 VERIFY_TOKEN 一致）
  *   VERIFY_LIMIT  本轮最多验证多少个（默认 100，控制 Actions 时长）
- *   VERIFY_BATCH  每验证多少个回传一次（默认 10）
+ *   VERIFY_BATCH  每验证多少个回传一次（默认 3；调小是为让「被杀的轮次」也能落库部分结果，见下方注释）
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -46,7 +46,11 @@ const exec = promisify(execFile);
 const API = process.env.DPH_API_URL || "https://dpharness.com";
 const TOKEN = process.env.DPH_API_TOKEN || "";
 const LIMIT = parseInt(process.env.VERIFY_LIMIT || "100", 10);
-const BATCH = Math.max(1, parseInt(process.env.VERIFY_BATCH || "10", 10));
+// 回传粒度默认 3（原为 10）。原因：外部「杀预算」最坏只给 ~77s，一轮约只跑完 8 条，
+// 而 SIGTERM 是硬杀、无 handler 兜底 ⇒ 缓冲攒不满 10 则该轮 report 零回传
+//（2026-09-10~09-14 连续 5 天零回传即此形态）。
+// 改为 3 后首次回传落在第 3 条（≈43s），早于历史最早杀点；回传次数 10→33（≈+7s），可忽略。
+const BATCH = Math.max(1, parseInt(process.env.VERIFY_BATCH || "3", 10));
 // 磁盘余量保护阈值（MB）：低于它就提前收尾并回传，别等环境把进程杀掉。
 // 每次 dsh plugin add 都会往 pnpm store 落依赖，100 个插件累积可观。
 const DISK_MIN_MB = Math.max(0, parseInt(process.env.VERIFY_DISK_MIN_MB || "2048", 10));
