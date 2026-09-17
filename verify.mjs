@@ -68,6 +68,24 @@ function classifyError(stderr, stdout) {
   if (!s.trim()) return { reason: "unknown", detail: "无输出" };
   if (/404|not found|repository.*not|could not resolve/.test(s) && /repo|github/.test(s))
     return { reason: "repo_missing", detail: "仓库不存在或已删除" };
+  /**
+   * git 依赖无法解析（2026-09-17 补，修「33 个插件被错标 unknown」）。
+   *
+   * 实测：本机跑一轮 30 个，24 个失败全部落到兜底的 `unknown`，
+   * 但查 verifyDetail 发现报错**全都一样**：`error: ERR_PNPM_GIT_RESOLVE...`。
+   * 即 **原因一直很明确，只是分类器缺规则**。
+   *
+   * 为什么必须单独归类（不只是「好看」）：
+   *   站点的价值主张是「用户不必自己试错」。
+   *   `unknown`（无法判定）⇒ 用户看了不知道该做什么，**等于没采集到信息**；
+   *   `git 依赖不可用` ⇒ 用户立刻知道装不了、原因是什么。
+   *   **分类错一条，几十上百个插件的信息就白采集了。**
+   */
+  if (/err_pnpm_git_resolve|git_resolve|git resolv/.test(s))
+    return {
+      reason: "git_dep_unresolvable",
+      detail: "依赖了无法解析的 git 源（私有仓库/仓库已删/需要凭证），无法安装",
+    };
   if (/engines|node version|unsupported node|requires node/.test(s))
     return { reason: "node_version", detail: "Node 版本不满足要求" };
   if (/peer|eresolve|conflict|unmet/.test(s))
