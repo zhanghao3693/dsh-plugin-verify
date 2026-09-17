@@ -86,6 +86,32 @@ function classifyError(stderr, stdout) {
       reason: "git_dep_unresolvable",
       detail: "依赖了无法解析的 git 源（私有仓库/仓库已删/需要凭证），无法安装",
     };
+  /**
+   * 依赖树/规格类失败（2026-09-17 第二批补，把剩余 10 个 unknown 清空）。
+   *
+   * 实测这 10 个的真实原因都是 pnpm 的依赖解析失败，**没有一个是真「无法判定」**：
+   *   failed to resolve dependency tree            × 5
+   *   err_pnpm_exotic_subdep                       × 1
+   *   err_pnpm_spec_not_supported_by_any_resolver  × 1
+   *   err_pnpm_invalid_package_name                × 1
+   *   下载中断 / 输出 HELP                          × 2
+   */
+  if (/failed to resolve dependency tree|resolve depend/.test(s))
+    return {
+      reason: "dep_tree_unresolvable",
+      detail: "依赖树无法解析（某个依赖的版本/来源在当前 registry 下取不到）",
+    };
+  if (/err_pnpm_exotic_subdep|err_pnpm_spec_not_supported/)
+    return {
+      reason: "unsupported_dep_spec",
+      detail: "依赖使用了 pnpm 不支持的源或规格（如 file:/link: 本地路径、非常规协议）",
+    };
+  if (/err_pnpm_invalid_package_name|invalid package name/.test(s))
+    return { reason: "invalid_package_name", detail: "package.json 里的包名不合法" };
+  if (/downloading .*(b|kb|mb)\//.test(s) && !/error|×/.test(s))
+    return { reason: "download_interrupted", detail: "依赖下载未完成（超时或中断）" };
+  if (/usage: pnpm|help: package manager/.test(s))
+    return { reason: "install_cmd_invalid", detail: "安装命令参数不被 dsh/pnpm 接受" };
   if (/engines|node version|unsupported node|requires node/.test(s))
     return { reason: "node_version", detail: "Node 版本不满足要求" };
   if (/peer|eresolve|conflict|unmet/.test(s))
