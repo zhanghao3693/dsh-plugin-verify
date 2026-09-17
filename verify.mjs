@@ -59,8 +59,25 @@ const OUT_FILE = "verify-results.json";
  * 「环境侧」失败原因：与插件本身能不能装无关，只反映验证环境的策略差异。
  * 这类原因上报 skip（站点落 none），不计入 fail。
  * 与站点侧保持一致：app/api/verify/report/route.ts、详情页的 ENV_SIDE_REASONS。
+ *
+ * ⚠ git_dep_unresolvable 为什么算环境侧（2026-09-17 取证）：
+ *   该原因被列进 fail 会让**整类网络故障变成插件缺陷**。2026-09-17 11:27 那轮
+ *   就是现场：24 个 GitHub 源插件全失败、6 个 npm 包全通过，失败与「安装路径」
+ *   100% 相关、与插件本身无关。取证：
+ *     ① 24 个失败仓库逐个查 api.github.com → 全部 public=true，0 个不存在；
+ *     ② 本机 `nc github.com 443` TCP 超时（绕代理直连同样超时），
+ *        而 api.github.com 200/0.5s、registry.npmjs.org 200/0.8s；
+ *     ③ 09:21 那轮曾通过的两个对照仓库（libukai/...、chainbase-labs/...）
+ *        在同一台机器上现在同样失败 ⇒ 不是仓库变了，是通道断了。
+ *   故判为环境侧：站点落 none「未验证」。宁可不给结论，也不给错结论
+ *   （同 build_script_blocked 的口径，见 app/api/verify/report/route.ts 注释）。
+ *   配套：run-verify.sh 已加 GitHub 连通性前置门，通道不通时整轮不跑。
  */
-const ENV_SIDE_REASONS = new Set(["build_script_blocked", "network"]);
+const ENV_SIDE_REASONS = new Set([
+  "build_script_blocked",
+  "network",
+  "git_dep_unresolvable",
+]);
 
 /** 失败原因分类：把 stderr 映射到可读结论（对齐 dsh-suite 的 🟢/🔴 徽章语义） */
 function classifyError(stderr, stdout) {
@@ -101,7 +118,11 @@ function classifyError(stderr, stdout) {
       reason: "dep_tree_unresolvable",
       detail: "依赖树无法解析（某个依赖的版本/来源在当前 registry 下取不到）",
     };
-  if (/err_pnpm_exotic_subdep|err_pnpm_spec_not_supported/)
+  // ⚠ 2026-09-17 修：原写法漏了 `.test(s)`（`if (/正则/)` 里正则字面量恒为真），
+  //   导致本行**无条件命中**，把后面所有规则全吞掉 —— build_script_blocked /
+  //   network / dependency_conflict / node_version 全被错标成 unsupported_dep_spec。
+  //   其中 build_script_blocked 被吞会再犯 9/15 的错（把验证环境差异写成插件未通过）。
+  if (/err_pnpm_exotic_subdep|err_pnpm_spec_not_supported/.test(s))
     return {
       reason: "unsupported_dep_spec",
       detail: "依赖使用了 pnpm 不支持的源或规格（如 file:/link: 本地路径、非常规协议）",
@@ -148,22 +169,49 @@ const pending = [];
 /** 非 null 表示本轮提前收尾（如磁盘余量触发阈值），用于收尾时说明原因 */
 let earlyStop = null;
 
-/** 回传（增量或收尾）。失败不抛出——回传失败不该让整轮结果作废。 */
+/**
+ * 回传（增量或收尾）。失败不抛出——回传失败不该让整轮结果作废。
+ *
+ * ⚠️ 2026-09-17 加重试：原实现是**单次 fetch、失败即放弃**，
+ * 实测因此丢过数据 —— 第 14 个插件验证通过，但回传时
+ * `TypeError: fetch failed`（网络瞬时抖动），结果直接丢弃，
+ * 库里该插件仍是 `status=none`，等于这一轮的验证白跑。
+ *
+ * 重试策略：
+ *   · 最多 3 次，指数退避 1s / 2s / 4s；
+ *   · **只重试网络错误与 5xx**（4xx 是请求本身的问题，重试无意义，
+ *     例如 token 失效 —— 那需要改配置而不是重发）。
+ */
 async function report(items, label = "回传") {
   if (!TOKEN || !items.length) return false;
-  try {
-    const res = await fetch(`${API}/api/verify/report`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({ ranAt: new Date().toISOString(), results: items }),
-    });
-    const text = await res.text();
-    console.log(`  ${label} ${items.length} 条 → HTTP ${res.status} ${text.slice(0, 120)}`);
-    return res.ok;
-  } catch (e) {
-    console.error(`  ✗ ${label}失败：${String(e).slice(0, 200)}`);
-    return false;
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(`${API}/api/verify/report`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
+        body: JSON.stringify({ ranAt: new Date().toISOString(), results: items }),
+      });
+      const text = await res.text();
+      const tag = attempt > 1 ? `${label}（第 ${attempt} 次尝试）` : label;
+      console.log(`  ${tag} ${items.length} 条 → HTTP ${res.status} ${text.slice(0, 120)}`);
+      if (res.ok) return true;
+      // 4xx：请求本身有问题，重试也不会成功
+      if (res.status >= 400 && res.status < 500) {
+        console.error(`  ✗ ${label} 放弃重试（HTTP ${res.status} 属客户端错误）`);
+        return false;
+      }
+    } catch (e) {
+      const tag = attempt > 1 ? `（第 ${attempt} 次尝试）` : "";
+      console.error(`  ✗ ${label}失败${tag}：${String(e).slice(0, 160)}`);
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      const wait = 1000 * 2 ** (attempt - 1); // 1s → 2s → 4s
+      await new Promise((r) => setTimeout(r, wait));
+    }
   }
+  console.error(`  ✗ ${label} 重试 ${MAX_ATTEMPTS} 次仍失败，本轮该批结果未落库`);
+  return false;
 }
 
 function saveResults() {
@@ -308,8 +356,29 @@ async function main() {
     results.push(item);
     pending.push(item);
 
-    // 增量回传：一轮崩掉不至于结果全丢（9/10~9/14 连续 5 天 report 零回传的教训）
-    if (pending.length >= BATCH) await report(pending.splice(0));
+    /**
+     * 增量回传：一轮崩掉不至于结果全丢（9/10~9/14 连续 5 天 report 零回传的教训）。
+     *
+     * ⚠️ 2026-09-17 修严重 bug：原写法是 `await report(pending.splice(0))` ——
+     * **`splice(0)` 会先清空数组，与回传成功与否无关** ⇒ 回传失败时
+     * 这批结果**永久丢失、连抢救机会都没有**。
+     * 实测：`Nwflower/dsh-chat-import` 验证通过后回传遇 `fetch failed`，
+     * 库里最终是 `status=none`，这一轮的验证白跑。
+     *
+     * 改为「**成功才清空，失败放回队首**」，下次批量一起重发。
+     */
+    if (pending.length >= BATCH) {
+      const batch = pending.splice(0);
+      const ok = await report(batch);
+      if (!ok) {
+        // 放回队首，等下次重发；同时防止无限积压（保留最近 3 批以内）
+        pending.unshift(...batch);
+        if (pending.length > BATCH * 3) {
+          const dropped = pending.splice(BATCH * 3);
+          console.error(`  ⚠ 回传连续失败，丢弃最旧 ${dropped.length} 条以免内存无限增长`);
+        }
+      }
+    }
 
     // 资源诊断：9/14 那次以 exit 143（SIGTERM）在第 93 个插件处被杀，
     // 不是 job 超时（timeout-minutes 是 180 分钟），高度疑似内存或磁盘耗尽。
@@ -327,7 +396,14 @@ async function main() {
     fs.mkdirSync(env.DSH_CONFIG_DIR, { recursive: true });
   }
 
-  if (pending.length) await report(pending.splice(0));
+  // 收尾回传：进程即将退出，失败也没有"下一轮"可顺延，
+  // 但 report() 内部已带 3 次重试，足够扛住瞬时抖动。
+  if (pending.length) {
+    const okFinal = await report(pending.splice(0), "收尾回传");
+    if (!okFinal) {
+      console.error("  ⚠ 收尾回传失败 —— 结果已写入 verify-results.json，可手工补发");
+    }
+  }
   saveResults();
 
   const pass = results.filter((r) => r.status === "pass").length;
