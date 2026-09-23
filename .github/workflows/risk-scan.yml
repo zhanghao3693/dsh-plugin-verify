@@ -1,0 +1,67 @@
+name: dsh plugin risk scan
+
+# 静态风险扫描（与 verify.yml 的实装验证并列的第二个维度）。
+#
+# verify.yml  = 「装得上吗」—— 真的 dsh plugin add 一遍
+# 本 workflow = 「装上了它会做什么」—— 只读源码做静态分析，不执行任何插件代码
+#
+# 两者共用一个 secret（DPH_API_TOKEN，站点侧 RISK_TOKEN 未单独配置时回落 VERIFY_TOKEN）。
+#
+# ── 为什么用 cron 而不是「跑完自触发下一轮」────────────────────────────────
+# verify.yml 已实证：GitHub 禁止 workflow 监听自身（workflow_run 链会断），
+# 自链方案不可行。故这里沿用同一策略：cron 定时 + 手动 workflow_dispatch。
+#
+# 触发时间刻意与 verify 错开 30 分钟（verify 是整点 0 分）：
+# 两个 job 并发跑会争抢 runner 与 npm/codeload 出口带宽，
+# 错峰既减少互相拖慢，也避免同一时刻的两份长任务同时打满配额。
+on:
+  schedule:
+    - cron: "30 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "本轮扫描插件数"
+        required: false
+        default: "600"
+
+jobs:
+  risk-scan:
+    runs-on: ubuntu-latest
+    # 单轮预算：600 个 × 中位 3.8s ÷ 并发 4 ≈ 10 分钟。
+    # 留足余量（大包解包 + 重试 + 网络抖动），但不要设太大 ——
+    # 万一卡死，超时就是唯一的兜底。
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19"
+
+      # 自检必须在扫描之前：这几条不变式（动态命令可达、剪贴板读写分离、
+      # 证据截断不影响判定、证据快照可读）一旦失效，扫描**不会报错**，
+      # 只会静默给出更宽松的结论 —— 正是最危险的一类失效。
+      # 所以宁可整轮不跑，也不回传一份不可信的结论。
+      - name: Self-test invariants
+        run: node scripts/selftest.mjs
+
+      - name: Run risk scan
+        env:
+          RISK_CI: "1"
+          DPH_API_URL: https://dpharness.com
+          DPH_API_TOKEN: ${{ secrets.DPH_API_TOKEN }}
+          RISK_LIMIT: ${{ github.event.inputs.limit || '600' }}
+          RISK_CONCURRENCY: "4"
+          RISK_BATCH: "20"
+          # runner 磁盘不大，且一次全量要过 8000+ 个包的解包产物；
+          # 低于阈值就提前收尾并回传已完成部分，剩余顺延下一轮。
+          RISK_DISK_MIN_MB: "2048"
+        run: node risk-scan.mjs
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: risk-scan-results
+          path: risk-results.jsonl
+          retention-days: 30
