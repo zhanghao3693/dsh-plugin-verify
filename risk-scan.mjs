@@ -526,6 +526,27 @@ async function curlTo(url, out, token) {
 }
 
 /**
+ * GitHub 源码 tarball 下载地址。
+ *
+ * ⚠ 2026-09-23 实测修正：**不要用 `api.github.com/repos/{fullName}/tarball`**。
+ * 该端点在 GitHub Actions runner 上对**未认证**请求返回 **401**；
+ * 而本机 curl 同一 URL 返回 302（重定向到 codeload）——
+ * 也就是说**这个坑只在 CI 暴露，本地怎么跑都看不到**。
+ *
+ * 后果（首轮实测，limit=200）：171 个（85.5%）被判 `no_source`，
+ * 失败原因清一色 `扫描异常(Error: github tarball HTTP 401)`；
+ * 只有走 npm registry 的 29 个成功。npm 与 GitHub 是这个扫描器的两条腿，
+ * 断掉 GitHub 这条等于半残 —— 且它**不会报错**，只会静默给出「无法判定」。
+ *
+ * 改用 codeload（GitHub 官网「Download ZIP」实际用的就是它）：**匿名可用、零凭证**。
+ * 实测 `codeload.github.com/{fullName}/tar.gz/HEAD` → HTTP 200（公开仓库）。
+ * `HEAD` 会被解析为默认分支，因此无需先查 default_branch、也无需额外一次 API 调用。
+ */
+function ghTarballUrl(fullName) {
+  return `https://codeload.github.com/${fullName}/tar.gz/HEAD`;
+}
+
+/**
  * 取源码。npm 路径不可用时**自动回落到 GitHub**，并记录回落原因。
  *
  * 为什么必须回落（2026-09-19 实测取证）：站点库里的 `installCheck.pkgName`
@@ -562,7 +583,7 @@ async function fetchSource(t, token) {
     }
   }
 
-  const code = await curlTo(`https://api.github.com/repos/${t.fullName}/tarball`, `${dir}.tgz`, token);
+  const code = await curlTo(ghTarballUrl(t.fullName), `${dir}.tgz`, token);
   if (code !== "200") throw new Error(`github tarball HTTP ${code}${pkgFallback ? ` (npm 回落前错误: ${pkgFallback})` : ""}`);
   return await finish({ version: null, source: "github", requestedPkg: t.pkg, pkgFallback });
 }
@@ -579,7 +600,7 @@ async function fetchGithubOnly(t, token) {
   if (fs.existsSync(metaPath)) return { dir, ...JSON.parse(fs.readFileSync(metaPath, "utf8")) };
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
-  const code = await curlTo(`https://api.github.com/repos/${t.fullName}/tarball`, `${dir}.tgz`, token);
+  const code = await curlTo(ghTarballUrl(t.fullName), `${dir}.tgz`, token);
   if (code !== "200") throw new Error(`github tarball HTTP ${code}`);
   await exec("tar", ["-xzf", `${dir}.tgz`, "-C", dir, "--strip-components=1"], { maxBuffer: 32 * 1024 * 1024 });
   const info = { version: null, source: "github", requestedPkg: t.pkg || null, secondSource: true };
