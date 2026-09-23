@@ -505,9 +505,6 @@ function scanFile(src, rel) {
 const CACHE = process.env.RISK_CACHE_DIR || "/tmp/dshrisk-cache";
 fs.mkdirSync(CACHE, { recursive: true });
 
-/** 临时诊断（定位完删）：只对前几次非 200 的响应打印完整 curl 命令行（token 打码） */
-let curlDbgLeft = 4;
-
 async function curlTo(url, out, token) {
   const args = [
     "-sSL",
@@ -522,12 +519,7 @@ async function curlTo(url, out, token) {
   args.push(url);
   try {
     const r = await exec("curl", args, { maxBuffer: 8 * 1024 * 1024 });
-    const code = r.stdout.trim();
-    if (code !== "200" && curlDbgLeft-- > 0) {
-      const masked = args.map((a) => (String(a).includes("Bearer") ? "Authorization: Bearer ***" : a));
-      console.log(`[curlDbg] code=${code} argv=${JSON.stringify(masked)}`);
-    }
-    return code;
+    return r.stdout.trim();
   } catch (e) {
     return `curl_err_${e.code ?? "?"}`;
   }
@@ -1202,50 +1194,6 @@ async function ciMain() {
     process.exit(1);
   }
 
-  /**
-   * 临时诊断（2026-09-23，定位完即删）。
-   *
-   * 起因：CI 内诊断 step 对**同一仓库同一 URL** 用同一个 $GH_TOKEN 拿 200，
-   * 而扫描器却报 401（且只用 0.1s，说明是一次快速的真实拒绝，不是超时/限流）。
-   * ⇒ 必须打印**扫描器进程实际持有的 token 特征**，并在同一个进程里直接 curl 一次，
-   *   把「诊断 step 的 token」与「扫描器的 token」逐字对照。
-   */
-  try {
-    const probe = "https://api.github.com/repos/melandlabs/opencontext/tarball";
-    const r1 = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", "-H", `Authorization: Bearer ${token}`, probe], { maxBuffer: 8 * 1024 * 1024 });
-    const r2 = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", probe], { maxBuffer: 8 * 1024 * 1024 });
-    console.log(`[probe] GH_TOKEN 长度=${token.length} 前缀=${token.slice(0, 4) || "(空)"} 带token=${r1.stdout.trim()} 匿名=${r2.stdout.trim()}`);
-
-    /**
-     * 关键对照：**直接调用扫描器自己用的 curlTo()**。
-     * 手写 curl 两次都 200，但扫描时全线 401 ⇒ 差异只可能在 curlTo 的参数上。
-     */
-    const viaCurlTo = await curlTo(probe, "/tmp/probeA.tgz", token);
-    let viaNoRetryAll = "n/a";
-    try {
-      const rb = await exec("curl", ["-sSL", "--retry", "4", "--retry-delay", "2", "--connect-timeout", "15", "--max-time", "180", "-o", "/tmp/probeB.tgz", "-w", "%{http_code}", "-H", `Authorization: Bearer ${token}`, probe], { maxBuffer: 8 * 1024 * 1024 });
-      viaNoRetryAll = rb.stdout.trim();
-    } catch (e) { viaNoRetryAll = `err:${String(e).slice(0, 80)}`; }
-    console.log(`[probe2] 经 curlTo()=${viaCurlTo}  去掉 retry-all-errors=${viaNoRetryAll}`);
-
-    /**
-     * 第三组对照：**连续 12 次**同一 URL。
-     * 若从第 N 次开始变 401 ⇒ 确认是「同一 runner IP 的连续/批量请求被拒」
-     * （与 token、URL、参数、仓库全部无关）。
-     * 只取前 1KB（-r 0-1023）避免每次下载整个包。
-     */
-    const codes = [];
-    for (let i = 0; i < 12; i++) {
-      try {
-        const ri = await exec("curl", ["-sSL", "-r", "0-1023", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "20", "-H", `Authorization: Bearer ${token}`, probe], { maxBuffer: 8 * 1024 * 1024 });
-        codes.push(ri.stdout.trim());
-      } catch (e) { codes.push("err"); }
-    }
-    console.log(`[probe3] 连续 12 次 = ${codes.join(",")}`);
-  } catch (e) {
-    console.log(`[probe] 失败：${String(e).slice(0, 200)}`);
-  }
-
   console.log(`▶ 规则版本 ${RULE_VERSION}｜并发 ${CI_CONC}｜本轮上限 ${CI_LIMIT}｜缓存 ${CACHE}`);
   console.log(`  磁盘余量 root=${diskFreeMB("/")}MB tmp=${diskFreeMB(os.tmpdir?.() || "/tmp")}MB`);
 
@@ -1273,30 +1221,6 @@ async function ciMain() {
   }
 
   console.log(`▶ 本轮待扫 ${targets.length} 个｜队列剩余未扫 ${queueRemaining ?? "?"}`);
-
-  /**
-   * 第四组对照（临时，定位完即删）：对**本轮真实要扫的那个仓库**做同样探针。
-   *
-   * 前三组已经排除：token（40 位 gho_）、参数、curlTo 本身、并发、速率
-   * —— opencontext 连续 12 次全部 200。剩下唯一变量就是**目标仓库不同**。
-   * 所以必须对 targets[0] 本体打一次，看 CI 对它的响应与 opencontext 是否不同。
-   */
-  if (targets[0]?.fullName) {
-    const tn = targets[0].fullName;
-    const u = `https://api.github.com/repos/${tn}/tarball`;
-    const a = await curlTo(u, "/tmp/probe_t0.tgz", token);
-    let b = "n/a";
-    try {
-      const rb = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", "-H", `Authorization: Bearer ${token}`, u], { maxBuffer: 8 * 1024 * 1024 });
-      b = rb.stdout.trim();
-    } catch (e) { b = `err:${String(e).slice(0, 60)}`; }
-    let c = "n/a";
-    try {
-      const rc = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code},size=%{size_download},time=%{time_total}", "--max-time", "30", "-H", `Authorization: Bearer ${token}`, `https://api.github.com/repos/melandlabs/opencontext/tarball`], { maxBuffer: 8 * 1024 * 1024 });
-      c = rc.stdout.trim();
-    } catch (e) { c = `err:${String(e).slice(0, 60)}`; }
-    console.log(`[probe4] targets[0]=${tn} | curlTo=${a} 手写=${b} || 对照 opencontext: ${c}`);
-  }
   if (!targets.length) {
     // 队列空不是异常（全量扫完了）。正常退出，让 workflow 自然结束、不续跑。
     console.log("  队列已空，无需扫描");
