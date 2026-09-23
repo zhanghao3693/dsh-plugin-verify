@@ -54,13 +54,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
         run: |
-          for R in "FuRongJun-1999/dsh-memory" "Qiuner/QCode" "FishBottle7/opencode2dsh" "BruzWJ/Liang-Saint-Slider"; do
-            U="https://codeload.github.com/$R/tar.gz/HEAD"
+          # 只打印长度，绝不打印 token 值
+          echo "GH_TOKEN 长度 = ${#GH_TOKEN}"
+          # 测的是**实际报失败的仓库**，不是随手挑的
+          for R in "melandlabs/opencontext" "wess09/DeepSeekHarnessDesktop" "Aik358/dsh-auto-memory"; do
             echo "===== $R"
-            echo "  plain       : $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$U")"
-            echo "  scanner-args: $(curl -sSL --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 180 -o /tmp/t.tgz -w '%{http_code}' "$U")"
-            echo "  api-meta    : $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "https://api.github.com/repos/$R")"
-            echo "  resolved    : $(curl -sS -o /dev/null -w 'code=%{http_code} url=%{url_effective}' -L --max-time 30 "$U")"
+            echo "  anon tarball : $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "https://api.github.com/repos/$R/tarball")"
+            echo "  token tarball: $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$R/tarball")"
+            echo "  token meta   : $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$R")"
+            echo "  token rate   : $(curl -sS -H "Authorization: Bearer $GH_TOKEN" --max-time 30 https://api.github.com/rate_limit | head -c 120)"
+            echo "  codeload     : $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "https://codeload.github.com/$R/tar.gz/HEAD")"
           done
 
       - name: Run risk scan
