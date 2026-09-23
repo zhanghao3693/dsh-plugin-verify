@@ -1265,6 +1265,30 @@ async function ciMain() {
   }
 
   console.log(`▶ 本轮待扫 ${targets.length} 个｜队列剩余未扫 ${queueRemaining ?? "?"}`);
+
+  /**
+   * 第四组对照（临时，定位完即删）：对**本轮真实要扫的那个仓库**做同样探针。
+   *
+   * 前三组已经排除：token（40 位 gho_）、参数、curlTo 本身、并发、速率
+   * —— opencontext 连续 12 次全部 200。剩下唯一变量就是**目标仓库不同**。
+   * 所以必须对 targets[0] 本体打一次，看 CI 对它的响应与 opencontext 是否不同。
+   */
+  if (targets[0]?.fullName) {
+    const tn = targets[0].fullName;
+    const u = `https://api.github.com/repos/${tn}/tarball`;
+    const a = await curlTo(u, "/tmp/probe_t0.tgz", token);
+    let b = "n/a";
+    try {
+      const rb = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", "-H", `Authorization: Bearer ${token}`, u], { maxBuffer: 8 * 1024 * 1024 });
+      b = rb.stdout.trim();
+    } catch (e) { b = `err:${String(e).slice(0, 60)}`; }
+    let c = "n/a";
+    try {
+      const rc = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code},size=%{size_download},time=%{time_total}", "--max-time", "30", "-H", `Authorization: Bearer ${token}`, `https://api.github.com/repos/melandlabs/opencontext/tarball`], { maxBuffer: 8 * 1024 * 1024 });
+      c = rc.stdout.trim();
+    } catch (e) { c = `err:${String(e).slice(0, 60)}`; }
+    console.log(`[probe4] targets[0]=${tn} | curlTo=${a} 手写=${b} || 对照 opencontext: ${c}`);
+  }
   if (!targets.length) {
     // 队列空不是异常（全量扫完了）。正常退出，让 workflow 自然结束、不续跑。
     console.log("  队列已空，无需扫描");
