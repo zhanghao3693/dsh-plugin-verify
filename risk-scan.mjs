@@ -1194,6 +1194,23 @@ async function ciMain() {
     process.exit(1);
   }
 
+  /**
+   * 临时诊断（2026-09-23，定位完即删）。
+   *
+   * 起因：CI 内诊断 step 对**同一仓库同一 URL** 用同一个 $GH_TOKEN 拿 200，
+   * 而扫描器却报 401（且只用 0.1s，说明是一次快速的真实拒绝，不是超时/限流）。
+   * ⇒ 必须打印**扫描器进程实际持有的 token 特征**，并在同一个进程里直接 curl 一次，
+   *   把「诊断 step 的 token」与「扫描器的 token」逐字对照。
+   */
+  try {
+    const probe = "https://api.github.com/repos/melandlabs/opencontext/tarball";
+    const r1 = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", "-H", `Authorization: Bearer ${token}`, probe], { maxBuffer: 8 * 1024 * 1024 });
+    const r2 = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", probe], { maxBuffer: 8 * 1024 * 1024 });
+    console.log(`[probe] GH_TOKEN 长度=${token.length} 前缀=${token.slice(0, 4) || "(空)"} 带token=${r1.stdout.trim()} 匿名=${r2.stdout.trim()}`);
+  } catch (e) {
+    console.log(`[probe] 失败：${String(e).slice(0, 200)}`);
+  }
+
   console.log(`▶ 规则版本 ${RULE_VERSION}｜并发 ${CI_CONC}｜本轮上限 ${CI_LIMIT}｜缓存 ${CACHE}`);
   console.log(`  磁盘余量 root=${diskFreeMB("/")}MB tmp=${diskFreeMB(os.tmpdir?.() || "/tmp")}MB`);
 
