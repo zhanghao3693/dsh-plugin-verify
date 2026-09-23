@@ -1207,6 +1207,18 @@ async function ciMain() {
     const r1 = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", "-H", `Authorization: Bearer ${token}`, probe], { maxBuffer: 8 * 1024 * 1024 });
     const r2 = await exec("curl", ["-sSL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "30", probe], { maxBuffer: 8 * 1024 * 1024 });
     console.log(`[probe] GH_TOKEN 长度=${token.length} 前缀=${token.slice(0, 4) || "(空)"} 带token=${r1.stdout.trim()} 匿名=${r2.stdout.trim()}`);
+
+    /**
+     * 关键对照：**直接调用扫描器自己用的 curlTo()**。
+     * 手写 curl 两次都 200，但扫描时全线 401 ⇒ 差异只可能在 curlTo 的参数上。
+     */
+    const viaCurlTo = await curlTo(probe, "/tmp/probeA.tgz", token);
+    let viaNoRetryAll = "n/a";
+    try {
+      const rb = await exec("curl", ["-sSL", "--retry", "4", "--retry-delay", "2", "--connect-timeout", "15", "--max-time", "180", "-o", "/tmp/probeB.tgz", "-w", "%{http_code}", "-H", `Authorization: Bearer ${token}`, probe], { maxBuffer: 8 * 1024 * 1024 });
+      viaNoRetryAll = rb.stdout.trim();
+    } catch (e) { viaNoRetryAll = `err:${String(e).slice(0, 80)}`; }
+    console.log(`[probe2] 经 curlTo()=${viaCurlTo}  去掉 retry-all-errors=${viaNoRetryAll}`);
   } catch (e) {
     console.log(`[probe] 失败：${String(e).slice(0, 200)}`);
   }
