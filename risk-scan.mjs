@@ -505,6 +505,9 @@ function scanFile(src, rel) {
 const CACHE = process.env.RISK_CACHE_DIR || "/tmp/dshrisk-cache";
 fs.mkdirSync(CACHE, { recursive: true });
 
+/** 临时诊断（定位完删）：只对前几次非 200 的响应打印完整 curl 命令行（token 打码） */
+let curlDbgLeft = 4;
+
 async function curlTo(url, out, token) {
   const args = [
     "-sSL",
@@ -519,7 +522,12 @@ async function curlTo(url, out, token) {
   args.push(url);
   try {
     const r = await exec("curl", args, { maxBuffer: 8 * 1024 * 1024 });
-    return r.stdout.trim();
+    const code = r.stdout.trim();
+    if (code !== "200" && curlDbgLeft-- > 0) {
+      const masked = args.map((a) => (String(a).includes("Bearer") ? "Authorization: Bearer ***" : a));
+      console.log(`[curlDbg] code=${code} argv=${JSON.stringify(masked)}`);
+    }
+    return code;
   } catch (e) {
     return `curl_err_${e.code ?? "?"}`;
   }
