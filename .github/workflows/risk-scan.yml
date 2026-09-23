@@ -45,27 +45,6 @@ jobs:
       - name: Self-test invariants
         run: node scripts/selftest.mjs
 
-      # ── 临时诊断（2026-09-23，定位完即删）───────────────────────────────
-      # 关键差异测试：同一 URL 用「普通 curl 参数」与「扫描器 curlTo 的完整参数」
-      # 各打一次。扫描器失败只用 0.1s（说明不是网络往返超时），故怀疑是参数组合
-      # （--retry 4 --retry-all-errors --retry-delay 2）导致的行为差异。
-      # 同时测的是**实际报失败的仓库**，不是随手挑的仓库。
-      - name: Diagnose GitHub source access
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
-        run: |
-          # 只打印长度，绝不打印 token 值
-          echo "GH_TOKEN 长度 = ${#GH_TOKEN}"
-          # 测的是**实际报失败的仓库**，不是随手挑的
-          for R in "melandlabs/opencontext" "wess09/DeepSeekHarnessDesktop" "Aik358/dsh-auto-memory"; do
-            echo "===== $R"
-            echo "  anon tarball : $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "https://api.github.com/repos/$R/tarball")"
-            echo "  token tarball: $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$R/tarball")"
-            echo "  token meta   : $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$R")"
-            echo "  token rate   : $(curl -sS -H "Authorization: Bearer $GH_TOKEN" --max-time 30 https://api.github.com/rate_limit | head -c 120)"
-            echo "  codeload     : $(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "https://codeload.github.com/$R/tar.gz/HEAD")"
-          done
-
       - name: Run risk scan
         env:
           RISK_CI: "1"
@@ -75,11 +54,7 @@ jobs:
           # 此前 workflow 未配该变量 ⇒ 拉 GitHub 源码全部匿名 ⇒ CI 侧 401。
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           RISK_LIMIT: ${{ github.event.inputs.limit || '600' }}
-          # ⚠ 2026-09-23：并发从 4 降到 1 做验证。
-          # 同一进程内「串行单发探针」对 api.github.com 的 tarball 返回 200
-          # （带 token 与匿名都是 200），而扫描（并发 4）全线 401
-          # ⇒ 怀疑 GitHub 对 tarball 端点的高并发请求直接拒绝（限流伪装成 401）。
-          RISK_CONCURRENCY: "1"
+          RISK_CONCURRENCY: "4"
           RISK_BATCH: "20"
           # runner 磁盘不大，且一次全量要过 8000+ 个包的解包产物；
           # 低于阈值就提前收尾并回传已完成部分，剩余顺延下一轮。
