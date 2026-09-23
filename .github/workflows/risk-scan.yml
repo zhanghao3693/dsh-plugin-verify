@@ -75,7 +75,11 @@ jobs:
           # 此前 workflow 未配该变量 ⇒ 拉 GitHub 源码全部匿名 ⇒ CI 侧 401。
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           RISK_LIMIT: ${{ github.event.inputs.limit || '600' }}
-          RISK_CONCURRENCY: "4"
+          # ⚠ 2026-09-23：并发从 4 降到 1 做验证。
+          # 同一进程内「串行单发探针」对 api.github.com 的 tarball 返回 200
+          # （带 token 与匿名都是 200），而扫描（并发 4）全线 401
+          # ⇒ 怀疑 GitHub 对 tarball 端点的高并发请求直接拒绝（限流伪装成 401）。
+          RISK_CONCURRENCY: "1"
           RISK_BATCH: "20"
           # runner 磁盘不大，且一次全量要过 8000+ 个包的解包产物；
           # 低于阈值就提前收尾并回传已完成部分，剩余顺延下一轮。
