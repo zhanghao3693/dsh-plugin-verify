@@ -528,22 +528,29 @@ async function curlTo(url, out, token) {
 /**
  * GitHub 源码 tarball 下载地址。
  *
- * ⚠ 2026-09-23 实测修正：**不要用 `api.github.com/repos/{fullName}/tarball`**。
- * 该端点在 GitHub Actions runner 上对**未认证**请求返回 **401**；
- * 而本机 curl 同一 URL 返回 302（重定向到 codeload）——
- * 也就是说**这个坑只在 CI 暴露，本地怎么跑都看不到**。
+ * 两条路径（2026-09-23 实测后的结论，别再凭直觉换回去）：
+ *   · **带 token** → `api.github.com/repos/{fullName}/tarball`
+ *     认证请求额度 **5000/h**，一轮 600 个绰绰有余。
+ *   · **无 token** → `codeload.github.com/{fullName}/tar.gz/HEAD`（匿名兜底）
  *
- * 后果（首轮实测，limit=200）：171 个（85.5%）被判 `no_source`，
- * 失败原因清一色 `扫描异常(Error: github tarball HTTP 401)`；
- * 只有走 npm registry 的 29 个成功。npm 与 GitHub 是这个扫描器的两条腿，
- * 断掉 GitHub 这条等于半残 —— 且它**不会报错**，只会静默给出「无法判定」。
+ * 首轮实测（limit=200）：走 api.github.com 且**未带 token** ⇒ 171 个（85.5%）
+ * 报 `github tarball HTTP 401`，只有 npm 源那 29 个成功。
+ * 改成 codeload 后 ⇒ 150 个报 **404**，失败面没变。
  *
- * 改用 codeload（GitHub 官网「Download ZIP」实际用的就是它）：**匿名可用、零凭证**。
- * 实测 `codeload.github.com/{fullName}/tar.gz/HEAD` → HTTP 200（公开仓库）。
- * `HEAD` 会被解析为默认分支，因此无需先查 default_branch、也无需额外一次 API 调用。
+ * ⚠ 两个容易误判的点（本次都踩过）：
+ *   1. **本机怎么测都正常**：本机用扫描器同款 curl 参数（含 --retry-all-errors）
+ *      测那些「失败」仓库，codeload 与 api 全部 200；CI 内单发诊断同样全 200。
+ *      差异只出现在「CI + 批量请求 + 匿名」这个组合里 ⇒ 是**限流（匿名 60/h）**，
+ *      不是 URL 写错、也不是仓库不存在。
+ *   2. **`github.token` 救不了**：Actions 内置 token 作用域仅当前仓库，
+ *      读其他仓库等同匿名。必须用 PAT（workflow 里走 `secrets.GH_TOKEN`）。
+ *
+ * `HEAD` 用于 codeload 时会解析为默认分支，无需先查 default_branch。
  */
-function ghTarballUrl(fullName) {
-  return `https://codeload.github.com/${fullName}/tar.gz/HEAD`;
+function ghTarballUrl(fullName, hasToken) {
+  return hasToken
+    ? `https://api.github.com/repos/${fullName}/tarball`
+    : `https://codeload.github.com/${fullName}/tar.gz/HEAD`;
 }
 
 /**
@@ -583,8 +590,9 @@ async function fetchSource(t, token) {
     }
   }
 
-  const code = await curlTo(ghTarballUrl(t.fullName), `${dir}.tgz`, token);
-  if (code !== "200") throw new Error(`github tarball HTTP ${code}${pkgFallback ? ` (npm 回落前错误: ${pkgFallback})` : ""}`);
+  const ghUrl = ghTarballUrl(t.fullName, !!token);
+  const code = await curlTo(ghUrl, `${dir}.tgz`, token);
+  if (code !== "200") throw new Error(`github tarball HTTP ${code} @ ${ghUrl}${pkgFallback ? ` (npm 回落前错误: ${pkgFallback})` : ""}`);
   return await finish({ version: null, source: "github", requestedPkg: t.pkg, pkgFallback });
 }
 
@@ -600,8 +608,9 @@ async function fetchGithubOnly(t, token) {
   if (fs.existsSync(metaPath)) return { dir, ...JSON.parse(fs.readFileSync(metaPath, "utf8")) };
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
-  const code = await curlTo(ghTarballUrl(t.fullName), `${dir}.tgz`, token);
-  if (code !== "200") throw new Error(`github tarball HTTP ${code}`);
+  const ghUrl = ghTarballUrl(t.fullName, !!token);
+  const code = await curlTo(ghUrl, `${dir}.tgz`, token);
+  if (code !== "200") throw new Error(`github tarball HTTP ${code} @ ${ghUrl}`);
   await exec("tar", ["-xzf", `${dir}.tgz`, "-C", dir, "--strip-components=1"], { maxBuffer: 32 * 1024 * 1024 });
   const info = { version: null, source: "github", requestedPkg: t.pkg || null, secondSource: true };
   fs.writeFileSync(metaPath, JSON.stringify(info));
