@@ -1219,6 +1219,21 @@ async function ciMain() {
       viaNoRetryAll = rb.stdout.trim();
     } catch (e) { viaNoRetryAll = `err:${String(e).slice(0, 80)}`; }
     console.log(`[probe2] 经 curlTo()=${viaCurlTo}  去掉 retry-all-errors=${viaNoRetryAll}`);
+
+    /**
+     * 第三组对照：**连续 12 次**同一 URL。
+     * 若从第 N 次开始变 401 ⇒ 确认是「同一 runner IP 的连续/批量请求被拒」
+     * （与 token、URL、参数、仓库全部无关）。
+     * 只取前 1KB（-r 0-1023）避免每次下载整个包。
+     */
+    const codes = [];
+    for (let i = 0; i < 12; i++) {
+      try {
+        const ri = await exec("curl", ["-sSL", "-r", "0-1023", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "20", "-H", `Authorization: Bearer ${token}`, probe], { maxBuffer: 8 * 1024 * 1024 });
+        codes.push(ri.stdout.trim());
+      } catch (e) { codes.push("err"); }
+    }
+    console.log(`[probe3] 连续 12 次 = ${codes.join(",")}`);
   } catch (e) {
     console.log(`[probe] 失败：${String(e).slice(0, 200)}`);
   }
