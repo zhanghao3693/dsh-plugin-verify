@@ -512,7 +512,15 @@ async function curlTo(url, out, token) {
     // 而 execFile 在非零退出时直接抛错，连 HTTP 码都拿不到。
     // `--retry-all-errors` 让「传输中途断开」也进入重试，而不是当成失败。
     "--retry", "4", "--retry-all-errors", "--retry-delay", "2",
-    "--connect-timeout", "15", "--max-time", "180",
+    // 🔴 `--retry-max-time` 是**总重试窗口**（不是每次尝试的上限）。
+    // 2026-09-24 补：原先只有 `--max-time 180` + 4 次重试，二者组合**没有任何
+    // 总量上界** ⇒ 单条最坏 = 5 × 180 + 延迟 ≈ 908 秒（15 分钟）。
+    // 实测代价：一轮 20 个里 3 个撞上这个组合（53.8MB 的大仓 + 3 个 curl_err_28），
+    // 把并发 3 的槽位全占满 ⇒ 整轮从约 100 秒变成 30 分 24 秒，
+    // 16 条正常条目合计才约 270 秒 —— 即 **3/20 的条目吃掉了 94% 的墙钟**。
+    // 有了这一条，单条最坏被钉在约 240 秒（窗口 150s + 最后一次尝试 90s）。
+    "--retry-max-time", "150",
+    "--connect-timeout", "15", "--max-time", "90",
     "-o", out, "-w", "%{http_code}",
   ];
   if (token) args.push("-H", `Authorization: Bearer ${token}`);
@@ -553,6 +561,82 @@ function ghTarballUrl(fullName, hasToken) {
     : `https://codeload.github.com/${fullName}/tar.gz/HEAD`;
 }
 
+/** 打上「永久失败」标记的错误对象 —— 供 isPermanentFetchFailure 用**.permanent**判定。 */
+function permanentError(msg) {
+  const e = new Error(msg);
+  e.permanent = true;
+  return e;
+}
+
+/**
+ * 仓库体积闸门（2026-09-24 加）—— 避免单个超大仓库吃掉整轮的并发槽。
+ *
+ * 实测依据（生产服务器，limit=20 的一轮）：
+ *   `DSH-APP/DSHA` 是 **53.8 MB** 的仓库，其 tarball 下载耗时 **904.5 秒**，
+ *   最终只扫到 4 个文件。同一轮另有 3 条 `curl_err_28`（下载超时）。
+ *   4 条异常条目把并发 3 的槽位占满 ⇒ 整轮 30 分 24 秒，而 16 条正常条目
+ *   合计仅约 270 秒。
+ *
+ * 判据用 GitHub 仓库元数据的 `size` 字段（KB，服务端计算的仓库体积），
+ * 一次轻量 API 调用即可，无需先下载才发现巨大。
+ *
+ * ⚠ 三条刻意的「不拦」：
+ *   1. **无 token 时不拦** —— 匿名 api.github.com 只有 60/h，做不了逐条预检；
+ *      这种情况下退回「靠 curl 的总重试窗口兜底」（见 curlTo）。
+ *   2. **取不到体积时不拦** —— 宁可多花时间扫，也不要凭一次元数据失败就误杀一条。
+ *   3. 超限不是「环境侧失败」而是**既成事实** ⇒ 抛永久错误（permanent），
+ *      落 no_source 结案、不重排。这一条是**必需的**而不是优化：
+ *      阈值定得太高时，超出「单次下载预算」的仓库会**每次都下载失败** ⇒
+ *      永远落 scan_error ⇒ 永远重排 ⇒ 无限重试且永远得不到结论。
+ *      闸门把「下载不动的」先变成确定结论，才关掉这个死循环。
+ *
+ * ## 阈值怎么定的（2026-09-24 实测，勿凭感觉改）
+ *
+ * 实测两个点标定「仓库 size → 真实 tarball」的比例：`dsh_desktop`
+ * 112.5MB→18.7MB、`LongHorizon-Harness` 96.3MB→27.4MB 且都还没下完
+ * ⇒ **tarball ≈ 0.22 × size**（`size` 含 git 历史，故必然小于它）。
+ * 再对队首 150 个采样 size 分布，得到下表（单轮按 400 个算）：
+ *
+ * | 阈值 | 被判不可分析 | 单轮下载量 | 带宽耗时(@0.76MB/s) |
+ * |---|---|---|---|
+ * |  50MB | **16.7%** | 0.82 GB | 18 分钟 |
+ * | 100MB |  6.0% | 1.48 GB | 32 分钟 |
+ * | 200MB |  **2.0%** | 1.86 GB | 41 分钟 |
+ *
+ * 取 200MB 的理由：50MB 会把 **16.7%** 的插件永久判成「无法判定」——
+ * 那些只是仓库历史大、源码完全可分析，属无故损害数据；而 200MB 只影响 2%。
+ * 同时 200MB（tarball 约 44MB）**落在单次下载预算内**
+ * （`--max-time 90` @0.76MB/s ≈ 68MB tarball ⇒ 仓库约 309MB），
+ * 即被放行的条目都能在预算内真正下完，不会退化成上面的死循环。
+ * 另有实测的最大仓库 1413MB（tarball 约 310MB）—— 那是必须拦的一类。
+ */
+const MAX_REPO_MB = parseFloat(process.env.RISK_MAX_REPO_MB || "200");
+
+async function repoSizeKb(fullName, token) {
+  try {
+    const r = await exec(
+      "curl",
+      ["-sS", "--max-time", "15", "-H", `Authorization: Bearer ${token}`,
+       `https://api.github.com/repos/${fullName}`],
+      { maxBuffer: 4 * 1024 * 1024 }
+    );
+    const kb = Number(JSON.parse(r.stdout).size);
+    return Number.isFinite(kb) ? kb : null;
+  } catch {
+    return null; // 元数据取不到 ⇒ 不拦（见上面第 2 条）
+  }
+}
+
+async function assertRepoSizeOk(fullName, token) {
+  if (!token) return;
+  const kb = await repoSizeKb(fullName, token);
+  if (kb != null && kb > MAX_REPO_MB * 1024) {
+    throw permanentError(
+      `仓库体积 ${(kb / 1024).toFixed(1)}MB 超过扫描上限 ${MAX_REPO_MB}MB（避免单条拖垮整轮）`
+    );
+  }
+}
+
 /**
  * 取源码。npm 路径不可用时**自动回落到 GitHub**，并记录回落原因。
  *
@@ -590,6 +674,7 @@ async function fetchSource(t, token) {
     }
   }
 
+  await assertRepoSizeOk(t.fullName, token); // 体积闸门：超大仓库直接结案，不下载
   const ghUrl = ghTarballUrl(t.fullName, !!token);
   const code = await curlTo(ghUrl, `${dir}.tgz`, token);
   if (code !== "200") throw new Error(`github tarball HTTP ${code} @ ${ghUrl}${pkgFallback ? ` (npm 回落前错误: ${pkgFallback})` : ""}`);
@@ -608,6 +693,7 @@ async function fetchGithubOnly(t, token) {
   if (fs.existsSync(metaPath)) return { dir, ...JSON.parse(fs.readFileSync(metaPath, "utf8")) };
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
+  await assertRepoSizeOk(t.fullName, token); // 体积闸门（同 fetchSource，见其注释）
   const ghUrl = ghTarballUrl(t.fullName, !!token);
   const code = await curlTo(ghUrl, `${dir}.tgz`, token);
   if (code !== "200") throw new Error(`github tarball HTTP ${code} @ ${ghUrl}`);
@@ -1006,6 +1092,9 @@ async function scanOne(t, token) {
     }
   } catch (e) {
     rec.error = String(e).slice(0, 180);
+    // 把「扫描器已判定为永久失败」这件事带出去（如仓库体积超限）。
+    // 不能只靠回传时去正则匹配错误串 —— 那是事后猜，而这里是当场知道。
+    rec.permanent = !!(e && e.permanent);
     if (rec.auto !== "no_source") rec.auto = "error";
   }
   rec.ms = Date.now() - t0;
@@ -1140,6 +1229,8 @@ let ciEarlyStop = null;
  *   —— 若直接全文搜 404 就会把它误判成永久失败。故按段优先匹配。
  */
 function isPermanentFetchFailure(rec) {
+  // 扫描器自己下的判定（如「仓库体积超限」）优先 —— 它比事后猜错误串可靠。
+  if (rec.permanent) return true;
   const msg = String(rec.error || "");
   const gh = msg.match(/github tarball HTTP (\d+)/);
   if (gh) return gh[1] === "404";
