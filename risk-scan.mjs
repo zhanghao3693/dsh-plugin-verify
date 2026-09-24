@@ -1085,8 +1085,11 @@ const CI_OUT = process.env.RISK_OUT_FILE || "risk-results.jsonl";
  */
 if (CI_MODE && !token && process.env.RISK_SKIP_GATE !== "1") {
   console.error("⛔ 缺少 GH_TOKEN（GitHub 取源凭证）—— 本轮不跑。");
-  console.error("   理由：无凭证时 GitHub 取源会整批 401，结果会被记成「无法判定」落库，");
-  console.error("        既污染数据又白占队列名额。确需强制跑用 RISK_SKIP_GATE=1。");
+  console.error("   理由：无凭证时 GitHub 取源会整批 401，每个目标都要白跑一次取源");
+  console.error("        （约 1 秒/个）并回传一批 scan_error，纯属浪费一轮配额。");
+  console.error("        （数据安全上已不会污染：2026-09-24 起 scan_error 不写 riskAutoAt、");
+  console.error("         不冒充结论；本门只为省掉这一轮无谓开销。）");
+  console.error("   处置：修好 GH_TOKEN；确需强制跑用 RISK_SKIP_GATE=1。");
   process.exit(0);
 }
 
@@ -1111,24 +1114,77 @@ let ciPending = [];
 let ciEarlyStop = null;
 
 /**
+ * 环境侧失败的**永久性判定** —— 决定它是「重试」还是「结案」。
+ *
+ * 这个区分是 2026-09-24 加的。原实现把所有 `auto === "error"` 一律映射成
+ * `no_source` 并照常写 `riskAutoAt`，于是同一次环境抖动造成两处损害：
+ *   ① 因凭证/网络失败的插件被**当成结论**落到站点上，而站点对 no_source 的
+ *      解释是「已尝试扫描但取不到可分析的 JS/TS 源码」—— 与事实不符；
+ *   ② 它们同时被**移出队列**（队列按 riskAutoAt 升序、null 排最前取数），
+ *      要等整条队列走完才可能重扫 ⇒ 一次抖动换来半天到数天的覆盖空缺。
+ * 2026-09-24 实测现场：600/轮里 435 个报 401，全被记成 no_source。
+ *
+ * 现在分成两类：
+ *   · **永久**（404、包不存在）⇒ no_source，结案，不重排。
+ *     404 是插件侧的事实（仓库被删 / 改名 / 转私有），重试多少次都一样。
+ *   · **其余**（401/403/429/5xx / 超时 / 解包失败）⇒ scan_error，
+ *     **不写 riskAutoAt** ⇒ 自动排回队列，下一轮重试。
+ *
+ * ⚠ 兜底方向刻意选「重试」而不是「结案」，因为两者代价不对称：
+ *   判错成重试 = 多花一点配额，且在站点上**可见**；
+ *   判错成结案 = 产出**一条假装有结论的错误数据**，且**不可见**。
+ *   本项目对「环境差异被伪装成插件属性」是明令要避免的（见 README）。
+ *
+ * ⚠ 取码必须先看 GitHub 那一跳：错误串里可能同时含 npm 回落前的旧错误，
+ *   例如 `github tarball HTTP 500 @ … (npm 回落前错误: tarball HTTP 404)`
+ *   —— 若直接全文搜 404 就会把它误判成永久失败。故按段优先匹配。
+ */
+function isPermanentFetchFailure(rec) {
+  const msg = String(rec.error || "");
+  const gh = msg.match(/github tarball HTTP (\d+)/);
+  if (gh) return gh[1] === "404";
+  const npm = msg.match(/tarball HTTP (\d+)/);
+  if (npm) return npm[1] === "404";
+  // registry 里没有这个包（meta 无 dist-tags.latest，或直接返回 Not found）
+  if (/no latest tag|not\s*found/i.test(msg)) return true;
+  return false;
+}
+
+/**
  * 把 rec 映射成回传体。
  *
- * ⚠ 两处刻意的映射，不要「优化」掉：
+ * ⚠ 三处刻意的映射，不要「优化」掉：
  *
- * 1. `auto === "error"` → `no_source`。
- *    扫描过程中的异常（下载失败、解包失败、超时）属于**环境侧原因**，
- *    不构成对该插件的结论。绝不能让它落到 low —— 那就是凭空说它安全。
- *    这个映射与 verify 侧把环境侧失败上报 skip（站点落 none）是同一套口径。
+ * 1. `auto === "error"` **按失败性质分流**（2026-09-24 改，理由见
+ *    isPermanentFetchFailure）：
+ *      · 永久失败 → `no_source`（结案，服务端会写 riskAutoAt，从此不再重排）
+ *      · 环境侧失败 → `scan_error`（不结案，服务端**不写** riskAutoAt ⇒ 自动重排）
+ *    两者都绝不能落到 low —— 那就是凭空说它安全。
  *
  * 2. `facts` 与 `evidence` 分开传。
  *    evidence 是截断后的展示样本（每规则每文件最多 6 条），
  *    facts 是全量聚合。展示层写「共 N 处」必须取 facts，
  *    取 evidence 长度会系统性低估（实测 fs_read 低估 1.91 倍）。
+ *
+ * 3. `scan_error` 的 reasons 前缀与 `no_source` **必须不同**。
+ *    前者是「本次没扫成」，后者是「扫了但这个插件没有可分析源码」——
+ *    用户与运维要靠这句文案区分「执行故障」与「插件事实」。
  */
 function toReportItem(rec) {
-  const level = rec.auto === "error" ? "no_source" : rec.auto || "no_source";
+  const level =
+    rec.auto === "error"
+      ? isPermanentFetchFailure(rec)
+        ? "no_source"
+        : "scan_error"
+      : rec.auto || "no_source";
   const reasons = Array.isArray(rec.reasons) ? [...rec.reasons] : [];
-  if (rec.auto === "error" && rec.error) reasons.push(`扫描异常(${rec.error})`);
+  if (rec.auto === "error" && rec.error) {
+    reasons.push(
+      level === "scan_error"
+        ? `环境侧失败，已自动排回队列重扫（${rec.error}）`
+        : `取源不可用（${rec.error}）`
+    );
+  }
   return {
     fullName: rec.fullName,
     level,

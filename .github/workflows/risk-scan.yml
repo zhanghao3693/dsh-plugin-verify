@@ -14,9 +14,22 @@ name: dsh plugin risk scan
 # 触发时间刻意与 verify 错开 30 分钟（verify 是整点 0 分）：
 # 两个 job 并发跑会争抢 runner 与 npm/codeload 出口带宽，
 # 错峰既减少互相拖慢，也避免同一时刻的两份长任务同时打满配额。
+# ── 触发方式：仅手动（schedule 已于 2026-09-24 停用）─────────────────────────
+# 🔴 为什么停掉 schedule：这条线**已迁到 dpharness 生产服务器**（宿主 cron →
+#    dsh-verifier 容器 → docker 内网直连站点 API），见站点仓
+#    `scripts/server-cron/run-risk-round.sh`。
+#    两个原因：① hosted runner 的 schedule **只有约一半的计划轮次真正触发**
+#    （实测 2026-09-23/24：计划每 2 小时一轮，实际每天 5~6 轮）⇒ 吞吐不可控；
+#    ② 服务器侧可走 docker 内网直连，少一跳公网失败面。
+#
+# ⚠ 必须停掉 schedule 而不是"两边都跑"：两条线会用**同一个** `/api/risk/queue`，
+#   而队列排序是「未扫描优先」⇒ 两边每次都取到**同一批头部插件**，
+#   等于把 GitHub 额度与服务器算力各浪费一份，吞吐却完全不涨。
+#
+# 本 workflow 保留 workflow_dispatch 供应急（服务器故障时手动补一轮）。
+# ⚠ 若真要用它，注意本仓的 risk-scan.mjs 与站点仓的副本是**两份**，
+#   改动必须同步（用 sha256 校验，见站点仓 run-risk-round.sh 头部说明）。
 on:
-  schedule:
-    - cron: "30 */2 * * *"
   workflow_dispatch:
     inputs:
       limit:
