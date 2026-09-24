@@ -39,7 +39,7 @@ name: dsh plugin risk scan
 # 但仍刻意错开 15 分钟，避免同一时刻两份长任务抢 GitHub 侧出口。
 on:
   schedule:
-    - cron: "15,45 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       limit:
