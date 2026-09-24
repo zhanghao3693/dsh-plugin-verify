@@ -1071,6 +1071,25 @@ const CI_BATCH = Math.max(1, parseInt(process.env.RISK_BATCH || "20", 10));
 const CI_DISK_MIN_MB = Math.max(0, parseInt(process.env.RISK_DISK_MIN_MB || "2048", 10));
 const CI_OUT = process.env.RISK_OUT_FILE || "risk-results.jsonl";
 
+/**
+ * CI 模式的**前置门**：没有 GitHub 取源凭证就不开工。
+ *
+ * 依据（2026-09-24）：GitHub 源插件占队列的绝大多数，取源凭证缺失/失效时
+ * 它们**不会报错**，只会静默变成 `no_source` 落库 —— 也就是「无法判定」，
+ * 既吃掉队列名额（`riskAutoAt` 被写），又在站点上被读成一条结论。
+ * 那正是「环境侧失败被记成插件属性」这一类最危险的失效。
+ *
+ * 与实装验证侧 run-verify.sh 的 GitHub 连通性门同一个取舍：
+ * **宁可整轮不跑（2 小时后再来），也不写一批不可信的结论。**
+ * 逃生开关：RISK_SKIP_GATE=1（仅在确需强制跑一轮时使用）。
+ */
+if (CI_MODE && !token && process.env.RISK_SKIP_GATE !== "1") {
+  console.error("⛔ 缺少 GH_TOKEN（GitHub 取源凭证）—— 本轮不跑。");
+  console.error("   理由：无凭证时 GitHub 取源会整批 401，结果会被记成「无法判定」落库，");
+  console.error("        既污染数据又白占队列名额。确需强制跑用 RISK_SKIP_GATE=1。");
+  process.exit(0);
+}
+
 function diskFreeMB(p) {
   try {
     const st = fs.statfsSync(p);
@@ -1241,7 +1260,23 @@ async function ciMain() {
 
     let rec;
     try {
-      rec = await scanOne(t, CI_TOKEN);
+      /**
+       * ⚠ 第二个参数是 **GitHub 取源凭证**（`process.env.GH_TOKEN`），
+       * 不是回传站点用的 `CI_TOKEN` —— 两者用途完全不同。
+       *
+       * 2026-09-24 修：此处原为 `scanOne(t, CI_TOKEN)`，把**站点 API token**
+       * 当成 GitHub Bearer 发给了 `api.github.com`，于是**每一次** GitHub 取源
+       * 都返回 401，而 npm 源那部分照常成功（registry 请求不带这个头）。
+       * 现场特征（全部由这一个错配解释，别再往「限流/端点/仓库不存在」上查）：
+       *   · 本机跑批量模式全 200（那条路径传的是 `token`）、CI 里单发探针也 200
+       *     （探针直接用 `$GH_TOKEN`），只有 CI 批量 401；
+       *   · 错误从第 1 条就开始，同秒内 npm 源却成功 ⇒ 不是额度耗尽；
+       *   · 曾把端点换成 codeload，失败变成 404 —— 因为**错误的 Authorization 头
+       *     照旧被带上**了，换 URL 治不了，反而把根因掩盖成「端点问题」。
+       * 代价：600/轮的上限里约 72% 被记成「扫描异常」并落库为 `no_source`，
+       *      既吃掉了队列名额，又在站点上被当成「取不到源码」的结论。
+       */
+      rec = await scanOne(t, token);
     } catch (e) {
       // scanOne 内部已兜住大部分异常；这里兜最后一道，同样按无法判定处理
       rec = {
