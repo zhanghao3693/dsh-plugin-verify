@@ -30,6 +30,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,6 +45,24 @@ PAGE_SIZE = 100
 MAX_ROWS = 1000  # 防御性上限，正常 overall 只有几十行
 UA = "dpharness-arena-sync/1.0 (+https://dpharness.com)"
 REPORT_PATH = "/api/model-ranking/report"
+
+# HF datasets-server 的瞬时失败要重试，不能一次失败就整批放弃。
+#
+# 背景（2026-09-30 实测）：该服务的 /filter 端点会返回两类瞬时 500 ——
+#   · {"error": "the dataset index is loading, this can take a minute"}
+#   · {"error": "Authentication check on the Hugging Face Hub failed or timed out. ..."}
+# 同一天、相隔一分钟，dry-run 成功而紧接着的正式跑就 500 —— 纯概率性。
+# 而本工作流每天只跑一次，/filter 的索引在两次之间会被回收 ⇒ 每次都要现建 ⇒
+# 冷启动几乎天天命中。原先「非 2xx 即 raise SystemExit」的写法结果是
+# 「每天都失败但没人在看」：2026-09-16~09-29 共 13 次跑批仅 09-20 成功 1 次，
+# 线上国外榜因此停在 2026-09-13 的快照整整 17 天（详见 dpharness docs/MODEL_RANKING.md）。
+#
+# 重试边界：只重试 5xx / 429 / 网络层错误。4xx 一律立即失败 ——
+# 那才是真配置错（where 条件或字段名写错），重试只会把它埋掉。
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 30  # 秒；第 n 次失败后等 n*30s（30+60+90+120 = 最坏 5 分钟）
+RETRY_BUDGET = 8 * 60  # 秒；整轮抓取（含多个分页）累计可用于重试等待的上限
+_RUN_START = time.monotonic()  # 用于给重试等待封顶，避免撞上 workflow 的 20 分钟超时
 
 # 视为「非开源」的 license 取值；其余非空值都算开放权重
 CLOSED_LICENSES = {"proprietary", "unknown", ""}
@@ -91,15 +110,52 @@ def _err_detail(e: urllib.error.HTTPError) -> str:
         return raw[:500]
 
 
+def _is_retryable(e: urllib.error.HTTPError) -> bool:
+    """5xx 与 429 是服务端瞬时问题，值得重试；4xx 是调用方写错了，重试无意义。"""
+    return e.code >= 500 or e.code == 429
+
+
 def _get_json(url: str, timeout: int = 60) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        # 把 HF 的错误体打出来：字段名或 where 条件写错时，
-        # 光看状态码没法定位，必须看到 HF 的原话。
-        raise SystemExit(f"请求 HF datasets-server 失败 HTTP {e.code}: {_err_detail(e)}") from e
+    """取 JSON，对 HF datasets-server 的瞬时失败做退避重试。
+
+    整轮抓取的重试等待由 RETRY_BUDGET 封顶（多个分页共享同一预算），
+    这样即使 HF 长时间不可用，最长也只多耗预算那点时间，不会撞上
+    workflow 的 timeout-minutes: 20。
+    """
+    last = ""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if attempt > 1:
+                    print(f"HF 第 {attempt} 次尝试成功", flush=True)
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # 把 HF 的错误体打出来：字段名或 where 条件写错时，
+            # 光看状态码没法定位，必须看到 HF 的原话。
+            last = f"HTTP {e.code}: {_err_detail(e)}"
+            if not _is_retryable(e):
+                break
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = f"{type(e).__name__}: {e}"
+
+        if attempt == RETRY_ATTEMPTS:
+            break
+        spent = time.monotonic() - _RUN_START
+        wait = RETRY_BASE_DELAY * attempt
+        if spent + wait > RETRY_BUDGET:
+            print(
+                f"重试预算已用尽（已耗 {spent:.0f}s / 上限 {RETRY_BUDGET}s），不再重试",
+                flush=True,
+            )
+            break
+        print(
+            f"HF 瞬时失败（第 {attempt}/{RETRY_ATTEMPTS} 次）：{last}；{wait}s 后重试",
+            flush=True,
+        )
+        time.sleep(wait)
+
+    raise SystemExit(f"请求 HF datasets-server 失败（重试后仍不成功）{last}")
 
 
 def fetch_rows() -> list[dict]:
