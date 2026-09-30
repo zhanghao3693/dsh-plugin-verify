@@ -23,7 +23,10 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 → 40 分钟：HF 冷索引时脚本要退避重试（单请求最坏 450s×6 次尝试），
+    # 而总榜有 409 行、要分 5 页拉。20 分钟会把「已经重试成功、但分页没拉完」
+    # 的 run 从超时上杀掉，判成失败（2026-09-30 实测踩到）。
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 

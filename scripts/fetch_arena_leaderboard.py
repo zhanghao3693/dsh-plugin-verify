@@ -59,10 +59,16 @@ REPORT_PATH = "/api/model-ranking/report"
 #
 # 重试边界：只重试 5xx / 429 / 网络层错误。4xx 一律立即失败 ——
 # 那才是真配置错（where 条件或字段名写错），重试只会把它埋掉。
-RETRY_ATTEMPTS = 5
-RETRY_BASE_DELAY = 30  # 秒；第 n 次失败后等 n*30s（30+60+90+120 = 最坏 5 分钟）
-RETRY_BUDGET = 8 * 60  # 秒；整轮抓取（含多个分页）累计可用于重试等待的上限
-_RUN_START = time.monotonic()  # 用于给重试等待封顶，避免撞上 workflow 的 20 分钟超时
+RETRY_ATTEMPTS = 6
+RETRY_BASE_DELAY = 30  # 秒；第 n 次失败后等 n*30s（30+60+90+120+150 = 单请求最坏 450s）
+#
+# ⚠️ 这个「整轮预算」不能定小。曾经定 480s，实测直接踩坑：
+# 本脚本要分 5 页拉 409 行（PAGE_SIZE=100），而 HF 冷索引的退避序列本身最长 300s；
+# 于是第一页把预算吃光、后面 4 页一次都没得重试 ——
+# 日志里明明已经打出「HF 第 5 次尝试成功」，整个 run 仍然失败（2026-09-30 实测）。
+# 现在放到 25 分钟，足够「首页退避 + 再有一两页抖动」，同时仍能兜住整轮时长。
+RETRY_BUDGET = 25 * 60  # 秒；整轮抓取（含多个分页）累计可用于重试等待的软上限
+_RUN_START = time.monotonic()  # 给整轮重试等待封顶，避免无限拖延
 
 # 视为「非开源」的 license 取值；其余非空值都算开放权重
 CLOSED_LICENSES = {"proprietary", "unknown", ""}
@@ -118,9 +124,10 @@ def _is_retryable(e: urllib.error.HTTPError) -> bool:
 def _get_json(url: str, timeout: int = 60) -> dict:
     """取 JSON，对 HF datasets-server 的瞬时失败做退避重试。
 
-    整轮抓取的重试等待由 RETRY_BUDGET 封顶（多个分页共享同一预算），
-    这样即使 HF 长时间不可用，最长也只多耗预算那点时间，不会撞上
-    workflow 的 timeout-minutes: 20。
+    重试按**单次请求**计：每次调用各自最多 RETRY_ATTEMPTS 次。
+    RETRY_BUDGET 只是整轮抓取的宽松软上限（防无限拖延），
+    绝不能小到让「前面的分页把预算吃光、后面的分页一次都没得重试」——
+    2026-09-30 就是这样把一个本可成功的 run 判失败的（见上方常量处的注释）。
     """
     last = ""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
@@ -145,7 +152,7 @@ def _get_json(url: str, timeout: int = 60) -> dict:
         wait = RETRY_BASE_DELAY * attempt
         if spent + wait > RETRY_BUDGET:
             print(
-                f"重试预算已用尽（已耗 {spent:.0f}s / 上限 {RETRY_BUDGET}s），不再重试",
+                f"整轮重试预算已用尽（已耗 {spent:.0f}s / 上限 {RETRY_BUDGET}s），不再重试",
                 flush=True,
             )
             break
@@ -179,7 +186,9 @@ def fetch_rows() -> list[dict]:
             break
         rows.extend((item.get("row") or {}) for item in batch)
         total = data.get("num_rows_total") or 0
-        offset += PAGE_SIZE
+        # 按「实际拿到的行数」推进，而不是按 PAGE_SIZE ——
+        # 万一服务端单页上限小于我们请求的 length，按 PAGE_SIZE 推进会静默跳过中间的行。
+        offset += len(batch)
         if offset >= total:
             break
     return rows
